@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.netlify/
+
+.env
+.env.*
+!.env.example
+server/.env
+
+*.log
+npm-debug.log*
+
+server/public/uploads/*
+!server/public/uploads/.gitkeep

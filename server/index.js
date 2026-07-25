@@ -856,6 +856,17 @@ app.get('/api/export/excel', async (_req, res) => {
   res.send(buffer);
 });
 
+app.get('/', (_req, res) => {
+  res.json({
+    message: 'RMPL API is running',
+    health: '/api/health'
+  });
+});
+
+app.get('/api/health', (_req, res) => {
+  res.json({ ok: true });
+});
+
 async function startServer() {
   try {
     await connectDatabase();

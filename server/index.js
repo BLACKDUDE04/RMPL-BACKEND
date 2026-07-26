@@ -316,6 +316,7 @@ const playerSchema = new mongoose.Schema({
   team: String,
   teamId: { type: mongoose.Schema.Types.ObjectId, ref: 'Team', default: null },
   amount: Number,
+  age: Number,
   phone: String,
   tshirtSize: String,
   sold: Boolean,
@@ -739,6 +740,7 @@ app.patch('/api/players/:id/approve', async (req, res) => {
 app.post('/api/players/register', durableUpload(upload.fields([{ name: 'image', maxCount: 1 }, { name: 'paymentReceipt', maxCount: 1 }])), async (req, res) => {
   try {
     const name = String(req.body.name || '').trim();
+    const age = Number(req.body.age);
     const phone = String(req.body.phone || '').trim();
     const playedIn = String(req.body.playedIn || req.body.previouslyPlayedIn || '').trim();
     const tshirtSize = String(req.body.tshirtSize || '').trim();
@@ -748,6 +750,9 @@ app.post('/api/players/register', durableUpload(upload.fields([{ name: 'image', 
 
     if (!name) {
       return res.status(400).json({ message: 'Player name is required' });
+    }
+    if (!Number.isInteger(age) || age < 1) {
+      return res.status(400).json({ message: 'Please enter a valid age' });
     }
     if (!phone) {
       return res.status(400).json({ message: 'Phone number is required' });
@@ -772,6 +777,7 @@ app.post('/api/players/register', durableUpload(upload.fields([{ name: 'image', 
     const highestNumberPlayer = await Player.findOne({ category: normalizedCategory }).sort({ auctionNumber: -1 }).select('auctionNumber').lean();
     const player = await Player.create({
       name,
+      age,
       image: imageFile ? `/uploads/${imageFile.filename}` : '',
       details: resolveRegistrationDetails(selectedRoles),
       category: normalizedCategory,

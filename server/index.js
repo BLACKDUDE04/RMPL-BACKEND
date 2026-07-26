@@ -673,7 +673,7 @@ function resolveRegistrationDetails(selectedRoles = [], fallbackDetails = '') {
 }
 
 app.post('/api/players', durableUpload(upload.single('image')), async (req, res) => {
-  const { name, details, category, playedIn, team, amount, phone, imageUrl } = req.body;
+  const { name, age, details, category, playedIn, team, amount, phone, imageUrl } = req.body;
 
   if (!name?.trim()) {
     return res.status(400).json({ message: 'Player name is required' });
@@ -683,6 +683,7 @@ app.post('/api/players', durableUpload(upload.single('image')), async (req, res)
   const highestNumberPlayer = await Player.findOne({ category: normalizedCategory }).sort({ auctionNumber: -1 }).select('auctionNumber').lean();
   const player = await Player.create({
     name: name.trim(),
+    age: age ? Number(age) : undefined,
     image: req.file ? `/uploads/${req.file.filename}` : imageUrl?.trim() || '',
     details: details?.trim() || '',
     category: normalizedCategory,
@@ -806,7 +807,7 @@ app.post('/api/players/register', durableUpload(upload.fields([{ name: 'image', 
 });
 
 app.put('/api/players/:id', durableUpload(upload.single('image')), async (req, res) => {
-  const { name, details, category, playedIn, team, amount, phone, image, imageUrl } = req.body;
+  const { name, age, details, category, playedIn, team, amount, phone, image, imageUrl } = req.body;
   if (!name?.trim()) {
     return res.status(400).json({ message: 'Player name is required' });
   }
@@ -833,6 +834,7 @@ app.put('/api/players/:id', durableUpload(upload.single('image')), async (req, r
 
   const player = await Player.findByIdAndUpdate(req.params.id, {
     name: name.trim(),
+    age: age ? Number(age) : existingPlayer.age,
     details: details?.trim() || '',
     category: normalizedCategory,
     auctionNumber,
@@ -1105,6 +1107,7 @@ app.get('/api/export/excel', async (_req, res) => {
       .filter((player) => String(player.teamId || '') === String(team._id))
       .map((player) => ({
         Name: player.name,
+        Age: player.age || '',
         Category: player.category,
         Amount: player.amount,
         'Phone Number': player.phone || '',

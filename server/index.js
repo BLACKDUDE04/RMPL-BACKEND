@@ -6,6 +6,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const XLSX = require('xlsx');
 const mongoose = require('mongoose');
+const sharp = require('sharp');
 
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
@@ -24,7 +25,80 @@ const storage = multer.diskStorage({
   }
 });
 
-const upload = multer({ storage });
+const upload = multer({
+  storage,
+  limits: {
+    fileSize: 100 * 1024 * 1024,
+    files: 20
+  }
+});
+
+const imageUploadProfiles = {
+  backgroundImage: { maxDimension: 1920, quality: 82 },
+  image: { maxDimension: 1000, quality: 82 },
+  paymentReceipt: { maxDimension: 1600, quality: 82 },
+  logo: { maxDimension: 900, quality: 86 },
+  teamLogo: { maxDimension: 900, quality: 86 },
+  winnerImage: { maxDimension: 1200, quality: 84 },
+  eventImages: { maxDimension: 1600, quality: 82 }
+};
+
+function imageProfileFor(file) {
+  if (file.fieldname?.startsWith('categoryImage_')) return { maxDimension: 1400, quality: 82 };
+  if (file.fieldname?.startsWith('teamLogo_')) return imageUploadProfiles.teamLogo;
+  return imageUploadProfiles[file.fieldname] || { maxDimension: 1600, quality: 82 };
+}
+
+async function optimizeImageUpload(file) {
+  const optimizableTypes = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/tiff']);
+  if (!file?.path || !optimizableTypes.has(file.mimetype)) return file;
+
+  const { maxDimension, quality } = imageProfileFor(file);
+  const parsedPath = path.parse(file.path);
+  const optimizedFilename = `${path.parse(file.filename).name}.webp`;
+  const optimizedPath = path.join(parsedPath.dir, optimizedFilename);
+  const temporaryPath = path.join(parsedPath.dir, `${path.parse(file.filename).name}.optimizing.webp`);
+
+  try {
+    await sharp(file.path, { failOn: 'warning', limitInputPixels: 50_000_000 })
+      .rotate()
+      .resize({
+        width: maxDimension,
+        height: maxDimension,
+        fit: 'inside',
+        withoutEnlargement: true
+      })
+      .webp({
+        quality,
+        alphaQuality: 90,
+        effort: 5,
+        smartSubsample: true
+      })
+      .toFile(temporaryPath);
+
+    await fs.promises.unlink(file.path);
+    await fs.promises.rename(temporaryPath, optimizedPath);
+    const optimizedStats = await fs.promises.stat(optimizedPath);
+    file.filename = optimizedFilename;
+    file.path = optimizedPath;
+    file.mimetype = 'image/webp';
+    file.size = optimizedStats.size;
+    return file;
+  } catch (error) {
+    await fs.promises.unlink(temporaryPath).catch(() => {});
+    console.warn(`Image optimization skipped for ${file.originalname}:`, error.message);
+    return file;
+  }
+}
+
+async function optimizeRequestUploads(req) {
+  const files = [
+    ...(req.file ? [req.file] : []),
+    ...(Array.isArray(req.files) ? req.files : Object.values(req.files || {}).flat())
+  ];
+  await Promise.all(files.map(optimizeImageUpload));
+  return files;
+}
 
 function getUploadsBucket() {
   return new mongoose.mongo.GridFSBucket(mongoose.connection.db, { bucketName: 'uploads' });
@@ -58,7 +132,11 @@ const durableUpload = (middleware) => (req, res, next) => {
   middleware(req, res, async (error) => {
     if (error) return next(error);
     try {
+      const files = await optimizeRequestUploads(req);
       await persistRequestUploads(req);
+      res.on('finish', () => {
+        Promise.all(files.map((file) => fs.promises.unlink(file.path).catch(() => {}))).catch(() => {});
+      });
       next();
     } catch (persistError) {
       next(persistError);

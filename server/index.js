@@ -135,8 +135,15 @@ async function sendApprovalMessage(_phone, _playerName) {
 
 async function deleteUploadFile(filePath) {
   if (!filePath) return;
-  const normalizedPath = String(filePath).trim();
-  if (!normalizedPath || !normalizedPath.startsWith('/uploads/')) return;
+  let normalizedPath = String(filePath).trim();
+  if (/^https?:\/\//i.test(normalizedPath)) {
+    try {
+      normalizedPath = new URL(normalizedPath).pathname;
+    } catch {
+      return;
+    }
+  }
+  if (!normalizedPath.startsWith('/uploads/')) return;
   const fileName = path.basename(normalizedPath);
   const absolutePath = path.join(uploadDir, fileName);
   if (mongoose.connection.readyState === 1) {
@@ -151,6 +158,59 @@ async function deleteUploadFile(filePath) {
       console.warn('Failed to delete upload file', absolutePath, error.message);
     }
   }
+}
+
+function uploadPathPattern(filePath) {
+  if (!filePath) return null;
+  let normalizedPath = String(filePath).trim();
+  if (/^https?:\/\//i.test(normalizedPath)) {
+    try {
+      normalizedPath = new URL(normalizedPath).pathname;
+    } catch {
+      return null;
+    }
+  }
+  if (!normalizedPath.startsWith('/uploads/')) return null;
+  const escapedPath = normalizedPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`${escapedPath}$`);
+}
+
+async function deleteReplacedUpload(previousPath, nextPath) {
+  const previousPattern = uploadPathPattern(previousPath);
+  const nextPattern = uploadPathPattern(nextPath);
+  if (!previousPattern || String(previousPattern) === String(nextPattern)) return;
+
+  const referenceQuery = previousPattern;
+  const [settingsReferences, teamReferences, playerReferences, testimonialReferences] = await Promise.all([
+    Settings.countDocuments({
+      $or: [
+        { backgroundImage: referenceQuery }, { logo: referenceQuery },
+        { auctionStartAudio: referenceQuery }, { playerSoldAudio: referenceQuery },
+        { welcomeVideo: referenceQuery }, { 'categoryImages.allrounder': referenceQuery },
+        { 'categoryImages.batsmen': referenceQuery }, { 'categoryImages.bowler': referenceQuery },
+        { 'categoryImages.wicketkeeper': referenceQuery }, { 'categoryImages.mvp': referenceQuery },
+        { 'teams.logo': referenceQuery }
+      ]
+    }),
+    Team.countDocuments({ logo: referenceQuery }),
+    Player.countDocuments({ $or: [{ image: referenceQuery }, { paymentReceipt: referenceQuery }] }),
+    Testimonial.countDocuments({ $or: [{ images: referenceQuery }, { winnerImage: referenceQuery }] })
+  ]);
+
+  if (settingsReferences + teamReferences + playerReferences + testimonialReferences === 0) {
+    await deleteUploadFile(previousPath);
+  }
+}
+
+function collectUploadPaths(value, paths = new Set()) {
+  if (typeof value === 'string') {
+    if (uploadPathPattern(value)) paths.add(value);
+  } else if (Array.isArray(value)) {
+    value.forEach((item) => collectUploadPaths(item, paths));
+  } else if (value && typeof value === 'object') {
+    Object.values(value).forEach((item) => collectUploadPaths(item, paths));
+  }
+  return paths;
 }
 
 function parseRoleSelections(rawValues) {
@@ -424,6 +484,7 @@ app.post('/api/teams', durableUpload(upload.single('teamLogo')), async (req, res
 app.put('/api/teams/:id', durableUpload(upload.single('teamLogo')), async (req, res) => {
   const team = await Team.findById(req.params.id);
   if (!team) return res.status(404).json({ message: 'Team not found' });
+  const previousLogo = team.logo;
   const soldPlayers = await Player.find({ teamId: team._id, sold: true }).lean();
   const spent = soldPlayers.reduce((total, player) => total + Number(player.amount || 0), 0);
   const purse = Number(req.body.purse || 0);
@@ -435,6 +496,7 @@ app.put('/api/teams/:id', durableUpload(upload.single('teamLogo')), async (req, 
   else if (req.body.logoUrl !== undefined) team.logo = req.body.logoUrl.trim();
   await team.save();
   await Player.updateMany({ teamId: team._id }, { team: team.name });
+  await deleteReplacedUpload(previousLogo, team.logo);
   res.json({ message: 'Team updated successfully', team });
 });
 
@@ -653,6 +715,7 @@ app.put('/api/players/:id', durableUpload(upload.single('image')), async (req, r
 
   const existingPlayer = await Player.findById(req.params.id);
   if (!existingPlayer) return res.status(404).json({ message: 'Player not found' });
+  const previousImage = existingPlayer.image;
   const normalizedCategory = normalizeCategory(category);
   let auctionNumber = existingPlayer.auctionNumber;
   if (normalizedCategory !== existingPlayer.category) {
@@ -682,6 +745,7 @@ app.put('/api/players/:id', durableUpload(upload.single('image')), async (req, r
     image: req.file ? `/uploads/${req.file.filename}` : imageUrl?.trim() || image?.trim() || existingPlayer.image || ''
   }, { new: true, runValidators: true });
 
+  await deleteReplacedUpload(previousImage, player.image);
   res.json({ message: 'Player updated successfully', player });
 });
 
@@ -860,16 +924,19 @@ app.get('/api/settings', async (_req, res) => {
 app.post('/api/settings/welcome-video', durableUpload(upload.single('welcomeVideo')), async (req, res) => {
   if (!req.file) return res.status(400).json({ message: 'Choose a video file to upload' });
   const welcomeVideo = `/uploads/${req.file.filename}`;
+  const current = await Settings.findOne().lean();
   const settings = await Settings.findOneAndUpdate(
     {},
     { $set: { welcomeVideo } },
     { new: true, upsert: true, setDefaultsOnInsert: true }
   );
+  await deleteReplacedUpload(current?.welcomeVideo, welcomeVideo);
   res.json({ message: 'Welcome video saved successfully', welcomeVideo, settings });
 });
 
 app.post('/api/settings', durableUpload(upload.any()), async (req, res) => {
   const current = await Settings.findOne();
+  const previousUploadPaths = collectUploadPaths(current?.toObject() || {});
   const uploadedFiles = req.files || [];
   const backgroundFile = uploadedFiles.find((file) => file.fieldname === 'backgroundImage');
   const logoFile = uploadedFiles.find((file) => file.fieldname === 'logo');
@@ -917,6 +984,15 @@ app.post('/api/settings', durableUpload(upload.any()), async (req, res) => {
   } else {
     await Settings.create(nextSettings);
   }
+
+  const nextUploadPatterns = new Set(
+    [...collectUploadPaths(nextSettings)].map((filePath) => String(uploadPathPattern(filePath)))
+  );
+  await Promise.all(
+    [...previousUploadPaths]
+      .filter((filePath) => !nextUploadPatterns.has(String(uploadPathPattern(filePath))))
+      .map((filePath) => deleteReplacedUpload(filePath, ''))
+  );
 
   res.json(nextSettings);
 });

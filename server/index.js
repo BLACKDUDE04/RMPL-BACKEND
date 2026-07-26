@@ -317,6 +317,7 @@ const playerSchema = new mongoose.Schema({
   teamId: { type: mongoose.Schema.Types.ObjectId, ref: 'Team', default: null },
   amount: Number,
   phone: String,
+  tshirtSize: String,
   sold: Boolean,
   unsold: Boolean,
   source: String,
@@ -740,6 +741,7 @@ app.post('/api/players/register', durableUpload(upload.fields([{ name: 'image', 
     const name = String(req.body.name || '').trim();
     const phone = String(req.body.phone || '').trim();
     const playedIn = String(req.body.playedIn || req.body.previouslyPlayedIn || '').trim();
+    const tshirtSize = String(req.body.tshirtSize || '').trim();
     const selectedRoles = parseRoleSelections(req.body.roles);
     const imageFile = req.files?.image?.[0];
     const paymentFile = req.files?.paymentReceipt?.[0];
@@ -752,6 +754,9 @@ app.post('/api/players/register', durableUpload(upload.fields([{ name: 'image', 
     }
     if (!playedIn) {
       return res.status(400).json({ message: 'Previously played information is required' });
+    }
+    if (!/^\d+$/.test(tshirtSize) || Number(tshirtSize) < 1) {
+      return res.status(400).json({ message: 'Please enter a valid numeric T-shirt size' });
     }
     if (!selectedRoles.length) {
       return res.status(400).json({ message: 'Please select at least one role for the player' });
@@ -775,6 +780,7 @@ app.post('/api/players/register', durableUpload(upload.fields([{ name: 'image', 
       team: '',
       amount: 0,
       phone,
+      tshirtSize,
       sold: false,
       unsold: false,
       source: 'registration',
@@ -1096,6 +1102,7 @@ app.get('/api/export/excel', async (_req, res) => {
         Category: player.category,
         Amount: player.amount,
         'Phone Number': player.phone || '',
+        'T-Shirt Size': player.tshirtSize || '',
         Team: player.team || team.name
       }));
 

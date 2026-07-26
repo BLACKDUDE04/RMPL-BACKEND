@@ -3,12 +3,14 @@ const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const XLSX = require('xlsx');
 const mongoose = require('mongoose');
 
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
 const app = express();
+app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3001;
 const uploadDir = path.join(__dirname, 'public', 'uploads');
 let dataVersion = Date.now();
@@ -17,12 +19,71 @@ fs.mkdirSync(uploadDir, { recursive: true });
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, uploadDir),
   filename: (_req, file, cb) => {
-    const safeName = `${Date.now()}-${file.originalname.replace(/\s+/g, '-')}`;
+    const safeName = `${Date.now()}-${crypto.randomUUID()}-${file.originalname.replace(/\s+/g, '-')}`;
     cb(null, safeName);
   }
 });
 
 const upload = multer({ storage });
+
+function getUploadsBucket() {
+  return new mongoose.mongo.GridFSBucket(mongoose.connection.db, { bucketName: 'uploads' });
+}
+
+async function persistUpload(file) {
+  if (!file?.path || !file.filename) return;
+  const bucket = getUploadsBucket();
+  const existing = await bucket.find({ filename: file.filename }).limit(1).next();
+  if (existing) return;
+  await new Promise((resolve, reject) => {
+    fs.createReadStream(file.path)
+      .pipe(bucket.openUploadStream(file.filename, {
+        contentType: file.mimetype || 'application/octet-stream',
+        metadata: { originalName: file.originalname || file.filename }
+      }))
+      .on('error', reject)
+      .on('finish', resolve);
+  });
+}
+
+async function persistRequestUploads(req) {
+  const files = [
+    ...(req.file ? [req.file] : []),
+    ...(Array.isArray(req.files) ? req.files : Object.values(req.files || {}).flat())
+  ];
+  await Promise.all(files.map(persistUpload));
+}
+
+const durableUpload = (middleware) => (req, res, next) => {
+  middleware(req, res, async (error) => {
+    if (error) return next(error);
+    try {
+      await persistRequestUploads(req);
+      next();
+    } catch (persistError) {
+      next(persistError);
+    }
+  });
+};
+
+async function migrateLocalUploads() {
+  const contentTypes = {
+    '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+    '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
+    '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.mp4': 'video/mp4',
+    '.pdf': 'application/pdf'
+  };
+  const entries = await fs.promises.readdir(uploadDir, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isFile() || entry.name === '.gitkeep') continue;
+    await persistUpload({
+      path: path.join(uploadDir, entry.name),
+      filename: entry.name,
+      originalname: entry.name,
+      mimetype: contentTypes[path.extname(entry.name).toLowerCase()] || 'application/octet-stream'
+    });
+  }
+}
 
 const categoryAliases = {
   'all rounder': 'allrounder',
@@ -78,6 +139,11 @@ async function deleteUploadFile(filePath) {
   if (!normalizedPath || !normalizedPath.startsWith('/uploads/')) return;
   const fileName = path.basename(normalizedPath);
   const absolutePath = path.join(uploadDir, fileName);
+  if (mongoose.connection.readyState === 1) {
+    const bucket = getUploadsBucket();
+    const storedFiles = await bucket.find({ filename: fileName }).toArray();
+    await Promise.all(storedFiles.map((file) => bucket.delete(file._id)));
+  }
   try {
     await fs.promises.unlink(absolutePath);
   } catch (error) {
@@ -244,7 +310,38 @@ app.use(cors({
   }
 }));
 app.use(express.json({ limit: '10mb' }));
-app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
+
+app.use((req, res, next) => {
+  const sendJson = res.json.bind(res);
+  const assetOrigin = `${req.protocol}://${req.get('host')}`;
+  const resolveUploadPaths = (value) => {
+    if (typeof value === 'string' && value.startsWith('/uploads/')) return `${assetOrigin}${value}`;
+    if (Array.isArray(value)) return value.map(resolveUploadPaths);
+    if (value && typeof value.toJSON === 'function') return resolveUploadPaths(value.toJSON());
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, resolveUploadPaths(item)]));
+    }
+    return value;
+  };
+  res.json = (body) => sendJson(resolveUploadPaths(body));
+  next();
+});
+
+app.get('/uploads/:filename', async (req, res, next) => {
+  try {
+    const fileName = path.basename(req.params.filename);
+    const absolutePath = path.join(uploadDir, fileName);
+    if (fs.existsSync(absolutePath)) return res.sendFile(absolutePath);
+    const bucket = getUploadsBucket();
+    const storedFile = await bucket.find({ filename: fileName }).limit(1).next();
+    if (!storedFile) return res.status(404).json({ message: 'File not found' });
+    res.setHeader('Content-Type', storedFile.contentType || 'application/octet-stream');
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    bucket.openDownloadStream(storedFile._id).on('error', next).pipe(res);
+  } catch (error) {
+    next(error);
+  }
+});
 
 app.use((req, res, next) => {
   const changesBackendData = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)
@@ -311,7 +408,7 @@ app.get('/api/teams', async (_req, res) => {
   res.json({ teams: await teamsWithStats() });
 });
 
-app.post('/api/teams', upload.single('teamLogo'), async (req, res) => {
+app.post('/api/teams', durableUpload(upload.single('teamLogo')), async (req, res) => {
   const name = req.body.name?.trim();
   const purse = Number(req.body.purse || 0);
   if (!name) return res.status(400).json({ message: 'Team name is required' });
@@ -324,7 +421,7 @@ app.post('/api/teams', upload.single('teamLogo'), async (req, res) => {
   res.status(201).json({ message: 'Team created successfully', team });
 });
 
-app.put('/api/teams/:id', upload.single('teamLogo'), async (req, res) => {
+app.put('/api/teams/:id', durableUpload(upload.single('teamLogo')), async (req, res) => {
   const team = await Team.findById(req.params.id);
   if (!team) return res.status(404).json({ message: 'Team not found' });
   const soldPlayers = await Player.find({ teamId: team._id, sold: true }).lean();
@@ -359,7 +456,7 @@ app.get('/api/testimonials', async (_req, res) => {
   res.json({ testimonials });
 });
 
-app.post('/api/testimonials', upload.fields([{ name: 'eventImages', maxCount: 10 }, { name: 'winnerImage', maxCount: 1 }]), async (req, res) => {
+app.post('/api/testimonials', durableUpload(upload.fields([{ name: 'eventImages', maxCount: 10 }, { name: 'winnerImage', maxCount: 1 }])), async (req, res) => {
   if (!req.body.title?.trim()) return res.status(400).json({ message: 'Event title is required' });
   const testimonial = await Testimonial.create({
     title: req.body.title.trim(),
@@ -433,7 +530,7 @@ function resolveRegistrationDetails(selectedRoles = [], fallbackDetails = '') {
   return detailsParts.join(' | ');
 }
 
-app.post('/api/players', upload.single('image'), async (req, res) => {
+app.post('/api/players', durableUpload(upload.single('image')), async (req, res) => {
   const { name, details, category, playedIn, team, amount, phone, imageUrl } = req.body;
 
   if (!name?.trim()) {
@@ -490,7 +587,7 @@ app.patch('/api/players/:id/approve', async (req, res) => {
   });
 });
 
-app.post('/api/players/register', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'paymentReceipt', maxCount: 1 }]), async (req, res) => {
+app.post('/api/players/register', durableUpload(upload.fields([{ name: 'image', maxCount: 1 }, { name: 'paymentReceipt', maxCount: 1 }])), async (req, res) => {
   try {
     const name = String(req.body.name || '').trim();
     const phone = String(req.body.phone || '').trim();
@@ -548,7 +645,7 @@ app.post('/api/players/register', upload.fields([{ name: 'image', maxCount: 1 },
   }
 });
 
-app.put('/api/players/:id', upload.single('image'), async (req, res) => {
+app.put('/api/players/:id', durableUpload(upload.single('image')), async (req, res) => {
   const { name, details, category, playedIn, team, amount, phone, image, imageUrl } = req.body;
   if (!name?.trim()) {
     return res.status(400).json({ message: 'Player name is required' });
@@ -622,7 +719,7 @@ app.delete('/api/players/:id', async (req, res) => {
   res.json({ message: 'Player deleted successfully' });
 });
 
-app.post('/api/excel/import', upload.single('excelFile'), async (req, res) => {
+app.post('/api/excel/import', durableUpload(upload.single('excelFile')), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ message: 'Excel file is required' });
   }
@@ -760,7 +857,7 @@ app.get('/api/settings', async (_req, res) => {
   res.json(settings || { backgroundImage: '', logo: '' });
 });
 
-app.post('/api/settings/welcome-video', upload.single('welcomeVideo'), async (req, res) => {
+app.post('/api/settings/welcome-video', durableUpload(upload.single('welcomeVideo')), async (req, res) => {
   if (!req.file) return res.status(400).json({ message: 'Choose a video file to upload' });
   const welcomeVideo = `/uploads/${req.file.filename}`;
   const settings = await Settings.findOneAndUpdate(
@@ -771,7 +868,7 @@ app.post('/api/settings/welcome-video', upload.single('welcomeVideo'), async (re
   res.json({ message: 'Welcome video saved successfully', welcomeVideo, settings });
 });
 
-app.post('/api/settings', upload.any(), async (req, res) => {
+app.post('/api/settings', durableUpload(upload.any()), async (req, res) => {
   const current = await Settings.findOne();
   const uploadedFiles = req.files || [];
   const backgroundFile = uploadedFiles.find((file) => file.fieldname === 'backgroundImage');
@@ -856,20 +953,10 @@ app.get('/api/export/excel', async (_req, res) => {
   res.send(buffer);
 });
 
-app.get('/', (_req, res) => {
-  res.json({
-    message: 'RMPL API is running',
-    health: '/api/health'
-  });
-});
-
-app.get('/api/health', (_req, res) => {
-  res.json({ ok: true });
-});
-
 async function startServer() {
   try {
     await connectDatabase();
+    await migrateLocalUploads();
     await initializeDatabase();
     app.listen(PORT, () => {
       console.log(`Auction server running at http://localhost:${PORT}`);

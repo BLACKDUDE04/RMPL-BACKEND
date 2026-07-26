@@ -706,6 +706,14 @@ app.get('/api/players/registrations/pending', async (_req, res) => {
   res.json({ registrations });
 });
 
+app.get('/api/players/registrations', async (_req, res) => {
+  const registrations = await Player.find({ source: 'registration' })
+    .sort({ createdAt: -1 })
+    .lean();
+
+  res.json({ registrations });
+});
+
 app.patch('/api/players/:id/approve', async (req, res) => {
   const player = await Player.findById(req.params.id);
   if (!player) return res.status(404).json({ message: 'Registration not found' });

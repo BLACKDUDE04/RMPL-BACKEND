@@ -13,6 +13,7 @@ app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3001;
 const uploadDir = path.join(__dirname, 'public', 'uploads');
 let dataVersion = Date.now();
+let auctionDataVersion = dataVersion;
 const liveDataClients = new Set();
 let xlsxModule;
 let sharpModule;
@@ -277,8 +278,7 @@ async function deleteReplacedUpload(previousPath, nextPath) {
         { auctionStartAudio: referenceQuery }, { playerSoldAudio: referenceQuery },
         { welcomeVideo: referenceQuery }, { 'categoryImages.allrounder': referenceQuery },
         { 'categoryImages.batsmen': referenceQuery }, { 'categoryImages.bowler': referenceQuery },
-        { 'categoryImages.wicketkeeper': referenceQuery }, { 'categoryImages.mvp': referenceQuery },
-        { 'teams.logo': referenceQuery }
+        { 'categoryImages.wicketkeeper': referenceQuery }, { 'categoryImages.mvp': referenceQuery }
       ]
     }),
     Team.countDocuments({ logo: referenceQuery }),
@@ -324,7 +324,7 @@ const playerSchema = new mongoose.Schema({
   category: String,
   auctionNumber: Number,
   playedIn: String,
-  team: String,
+  team: { type: String, select: false },
   teamId: { type: mongoose.Schema.Types.ObjectId, ref: 'Team', default: null },
   amount: Number,
   age: Number,
@@ -350,6 +350,7 @@ const settingsSchema = new mongoose.Schema({
   playerLimitEnabled: { type: Boolean, default: false },
   maxPlayersPerTeam: { type: Number, default: 0, min: 0 },
   auctionCardSelectionEnabled: { type: Boolean, default: false },
+  scorerPasswordHash: { type: String, default: '', select: false },
   categoryImages: {
     allrounder: { type: String, default: '' },
     batsmen: { type: String, default: '' },
@@ -357,11 +358,7 @@ const settingsSchema = new mongoose.Schema({
     wicketkeeper: { type: String, default: '' }
     ,
     mvp: { type: String, default: '' }
-  },
-  teams: [{
-    name: String,
-    logo: String
-  }]
+  }
 }, { timestamps: true });
 
 playerSchema.index({ source: 1, registrationStatus: 1, createdAt: 1 });
@@ -377,6 +374,65 @@ const teamSchema = new mongoose.Schema({
   remainingPurse: { type: Number, default: 0, min: 0 }
 }, { timestamps: true });
 const Team = mongoose.model('Team', teamSchema);
+
+async function playersWithCurrentTeamNames(players) {
+  const plainPlayers = (players || []).map((player) => (
+    typeof player?.toObject === 'function' ? player.toObject() : player
+  ));
+  const teamIds = [...new Set(plainPlayers.map((player) => String(player.teamId || '')).filter(Boolean))];
+  if (!teamIds.length) return plainPlayers.map((player) => ({ ...player, team: '' }));
+  const teams = await Team.find({ _id: { $in: teamIds } }).select('name').lean();
+  const namesById = new Map(teams.map((team) => [String(team._id), team.name]));
+  return plainPlayers.map((player) => ({
+    ...player,
+    team: namesById.get(String(player.teamId || '')) || ''
+  }));
+}
+
+async function playerWithCurrentTeamName(player) {
+  if (!player) return player;
+  const [resolved] = await playersWithCurrentTeamNames([player]);
+  return resolved;
+}
+
+async function teamIsUsedInMatchHistory(teamId) {
+  const CricketMatch = mongoose.models.CricketMatch;
+  if (!CricketMatch) return false;
+  return Boolean(await CricketMatch.exists({
+    $or: [
+      { teamAId: teamId },
+      { teamBId: teamId },
+      { 'teamA.teamId': teamId },
+      { 'teamB.teamId': teamId },
+      { 'innings.battingTeamId': teamId },
+      { 'innings.bowlingTeamId': teamId }
+    ]
+  }));
+}
+
+async function playerIsUsedInMatchHistory(playerId) {
+  const CricketMatch = mongoose.models.CricketMatch;
+  if (!CricketMatch) return false;
+  return Boolean(await CricketMatch.exists({
+    $or: [
+      { 'teamA.players.playerId': playerId },
+      { 'teamB.players.playerId': playerId },
+      { teamAPlayerIds: playerId },
+      { teamBPlayerIds: playerId },
+      { 'innings.lineupEvents.strikerId': playerId },
+      { 'innings.lineupEvents.nonStrikerId': playerId },
+      { 'innings.lineupEvents.bowlerId': playerId },
+      { 'innings.deliveries.strikerId': playerId },
+      { 'innings.deliveries.nonStrikerId': playerId },
+      { 'innings.deliveries.bowlerId': playerId },
+      { 'innings.deliveries.wicket.dismissedBatterId': playerId },
+      { 'awards.manOfMatch.playerId': playerId },
+      { 'awards.bestBowler.playerId': playerId },
+      { manOfMatchPlayerId: playerId },
+      { bestBowlerPlayerId: playerId }
+    ]
+  }));
+}
 const testimonialSchema = new mongoose.Schema({
   title: { type: String, required: true, trim: true },
   description: { type: String, default: '' },
@@ -464,9 +520,7 @@ async function initializePlayerData() {
 async function initializeSettingsData() {
   const settingsCount = await Settings.countDocuments();
   if (settingsCount === 0) {
-    await Settings.create({ backgroundImage: '', logo: '', teams: [] });
-  } else {
-    await Settings.updateMany({ teams: { $exists: false } }, { $set: { teams: [] } });
+    await Settings.create({ backgroundImage: '', logo: '' });
   }
 }
 
@@ -526,13 +580,23 @@ app.get('/uploads/:filename', async (req, res, next) => {
 
 app.use((req, res, next) => {
   const changesBackendData = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)
-    && req.path !== '/api/auction/select';
+    && req.path !== '/api/auction/select'
+    && req.path !== '/api/scorer/session';
+  const changesScoringData = req.path === '/api/matches'
+    || req.path.startsWith('/api/matches/');
 
   if (changesBackendData) {
     res.on('finish', () => {
       if (res.statusCode >= 200 && res.statusCode < 400) {
         dataVersion = Math.max(Date.now(), dataVersion + 1);
-        const message = `event: version\ndata: ${JSON.stringify({ version: dataVersion })}\n\n`;
+        if (!changesScoringData) auctionDataVersion = dataVersion;
+        const message = `event: version\ndata: ${JSON.stringify({
+          version: dataVersion,
+          auctionVersion: auctionDataVersion,
+          path: req.path,
+          method: req.method,
+          sourceId: String(req.get('x-live-source') || '').slice(0, 100)
+        })}\n\n`;
         liveDataClients.forEach((client) => {
           if (client.destroyed || client.writableEnded) {
             liveDataClients.delete(client);
@@ -549,7 +613,7 @@ app.use((req, res, next) => {
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 app.get('/api/data-version', (_req, res) => {
   res.setHeader('Cache-Control', 'no-store');
-  res.json({ version: dataVersion });
+  res.json({ version: dataVersion, auctionVersion: auctionDataVersion });
 });
 
 app.get('/api/live-events', (req, res) => {
@@ -561,7 +625,10 @@ app.get('/api/live-events', (req, res) => {
   });
   res.flushHeaders?.();
   liveDataClients.add(res);
-  res.write(`retry: 2000\nevent: version\ndata: ${JSON.stringify({ version: dataVersion })}\n\n`);
+  res.write(`retry: 2000\nevent: version\ndata: ${JSON.stringify({
+    version: dataVersion,
+    auctionVersion: auctionDataVersion
+  })}\n\n`);
 
   const heartbeat = setInterval(() => {
     res.write(': keep-alive\n\n');
@@ -572,6 +639,8 @@ app.get('/api/live-events', (req, res) => {
     liveDataClients.delete(res);
   });
 });
+
+require('./scoring').registerScoringRoutes(app, { mongoose, Team, Player, Settings });
 
 const categoryNames = {
   allrounder: 'All Rounder',
@@ -648,7 +717,7 @@ async function teamsWithStats() {
       ...team,
       playerCount: teamPlayers.length,
       spent: teamPlayers.reduce((total, player) => total + Number(player.amount || 0), 0),
-      players: teamPlayers
+      players: teamPlayers.map((player) => ({ ...player, team: team.name }))
     };
   });
 }
@@ -659,6 +728,7 @@ app.get('/api/teams', async (_req, res) => {
 
 app.get('/api/bootstrap', async (_req, res) => {
   const version = dataVersion;
+  const auctionVersion = auctionDataVersion;
   const [categories, settings, teams, pendingRegistrations] = await Promise.all([
     loadCategories(),
     Settings.findOne().lean(),
@@ -669,10 +739,25 @@ app.get('/api/bootstrap', async (_req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   res.json({
     version,
+    auctionVersion,
     categories,
     settings: settings || { backgroundImage: '', logo: '' },
     teams,
     pendingRegistrations
+  });
+});
+
+app.get('/api/public/registration-summary', async (_req, res) => {
+  const [settings, registrationCount] = await Promise.all([
+    Settings.findOne().select('logo backgroundImage').lean(),
+    Player.countDocuments({ source: 'registration' })
+  ]);
+
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    logo: settings?.logo || '',
+    backgroundImage: settings?.backgroundImage || '',
+    registrationCount
   });
 });
 
@@ -703,7 +788,7 @@ app.put('/api/teams/:id', durableUpload(upload.single('teamLogo')), async (req, 
   if (req.file) team.logo = `/uploads/${req.file.filename}`;
   else if (req.body.logoUrl !== undefined) team.logo = req.body.logoUrl.trim();
   await team.save();
-  await Player.updateMany({ teamId: team._id }, { team: team.name });
+  await Player.updateMany({ teamId: team._id }, { $unset: { team: '' } });
   await deleteReplacedUpload(previousLogo, team.logo);
   res.json({ message: 'Team updated successfully', team });
 });
@@ -711,6 +796,11 @@ app.put('/api/teams/:id', durableUpload(upload.single('teamLogo')), async (req, 
 app.delete('/api/teams/:id', async (req, res) => {
   const team = await Team.findById(req.params.id);
   if (!team) return res.status(404).json({ message: 'Team not found' });
+  if (await teamIsUsedInMatchHistory(team._id)) {
+    return res.status(409).json({
+      message: 'This team is used in match history and cannot be deleted'
+    });
+  }
   await deleteUploadFile(team.logo);
   await Team.deleteOne({ _id: team._id });
   await Player.updateMany({ teamId: team._id }, { $set: { teamId: null } });
@@ -752,7 +842,7 @@ app.delete('/api/testimonials/:id', async (req, res) => {
 app.get('/api/players/selected', async (_req, res) => {
   const players = await Player.find({ sold: true }).sort({ updatedAt: -1 }).lean();
 
-  res.json({ players });
+  res.json({ players: await playersWithCurrentTeamNames(players) });
 });
 
 app.get('/api/players/unsold', async (_req, res) => {
@@ -762,7 +852,7 @@ app.get('/api/players/unsold', async (_req, res) => {
 
 app.get('/api/players', async (_req, res) => {
   const players = await Player.find().sort({ updatedAt: -1 }).lean();
-  res.json({ players });
+  res.json({ players: await playersWithCurrentTeamNames(players) });
 });
 
 function resolveRegistrationCategory(selectedRoles = [], fallbackCategory = 'allrounder') {
@@ -817,7 +907,6 @@ app.post('/api/players', durableUpload(upload.single('image')), async (req, res)
     category: normalizedCategory,
     auctionNumber: Number(highestNumberPlayer?.auctionNumber || 0) + 1,
     playedIn: playedIn?.trim() || team?.trim() || '',
-    team: '',
     amount: Number(amount || 0),
     phone: phone?.trim() || '',
     sold: false,
@@ -907,7 +996,6 @@ app.post('/api/players/register', durableUpload(upload.fields([{ name: 'image', 
       category: normalizedCategory,
       auctionNumber: Number(highestNumberPlayer?.auctionNumber || 0) + 1,
       playedIn: playedIn || '',
-      team: '',
       amount: 0,
       phone,
       tshirtSize,
@@ -955,21 +1043,30 @@ app.put('/api/players/:id', durableUpload(upload.single('image')), async (req, r
     if (!updatedTeam) return res.status(400).json({ message: 'Team does not have enough purse for the updated bid amount' });
   }
 
-  const player = await Player.findByIdAndUpdate(req.params.id, {
-    name: name.trim(),
-    age: age ? Number(age) : existingPlayer.age,
-    details: details?.trim() || '',
-    category: normalizedCategory,
-    auctionNumber,
-    playedIn: playedIn?.trim() || (!existingPlayer.sold ? team?.trim() : '') || existingPlayer.playedIn || '',
-    team: existingPlayer.sold ? existingPlayer.team : '',
-    amount: nextAmount,
-    phone: phone?.trim() || existingPlayer.phone || '',
-    image: req.file ? `/uploads/${req.file.filename}` : imageUrl?.trim() || image?.trim() || existingPlayer.image || ''
-  }, { new: true, runValidators: true });
+  const player = await Player.findByIdAndUpdate(
+    req.params.id,
+    {
+      $set: {
+        name: name.trim(),
+        age: age ? Number(age) : existingPlayer.age,
+        details: details?.trim() || '',
+        category: normalizedCategory,
+        auctionNumber,
+        playedIn: playedIn?.trim() || (!existingPlayer.sold ? team?.trim() : '') || existingPlayer.playedIn || '',
+        amount: nextAmount,
+        phone: phone?.trim() || existingPlayer.phone || '',
+        image: req.file ? `/uploads/${req.file.filename}` : imageUrl?.trim() || image?.trim() || existingPlayer.image || ''
+      },
+      $unset: { team: '' }
+    },
+    { new: true, runValidators: true }
+  );
 
   await deleteReplacedUpload(previousImage, player.image);
-  res.json({ message: 'Player updated successfully', player });
+  res.json({
+    message: 'Player updated successfully',
+    player: await playerWithCurrentTeamName(player)
+  });
 });
 
 app.patch('/api/players/:id/status', async (req, res) => {
@@ -988,16 +1085,27 @@ app.patch('/api/players/:id/status', async (req, res) => {
   }
   if (req.body.status !== 'sold') {
     updates.teamId = null;
-    updates.team = '';
   }
-  const player = await Player.findByIdAndUpdate(req.params.id, updates, { new: true });
+  const player = await Player.findByIdAndUpdate(
+    req.params.id,
+    { $set: updates, $unset: { team: '' } },
+    { new: true }
+  );
   if (!player) return res.status(404).json({ message: 'Player not found' });
-  res.json({ message: `Player marked as ${req.body.status}`, player });
+  res.json({
+    message: `Player marked as ${req.body.status}`,
+    player: await playerWithCurrentTeamName(player)
+  });
 });
 
 app.delete('/api/players/:id', async (req, res) => {
   const player = await Player.findById(req.params.id);
   if (!player) return res.status(404).json({ message: 'Player not found' });
+  if (await playerIsUsedInMatchHistory(player._id)) {
+    return res.status(409).json({
+      message: 'This player is used in match history and cannot be deleted'
+    });
+  }
   if (player.sold && player.teamId) {
     await Team.findByIdAndUpdate(player.teamId, { $inc: { remainingPurse: Number(player.amount || 0) } });
   }
@@ -1032,7 +1140,6 @@ app.post('/api/excel/import', durableUpload(upload.single('excelFile')), async (
       details: row[columns.details] || row.details || row.description || row.role || 'Imported player',
       category: normalizeCategory(row[columns.category] || row.category || row.type || 'allrounder'),
       playedIn: row[columns.team] || row.team || '',
-      team: '',
       amount: Number(row[columns.amount] || row.amount || 0),
       phone: String(row[columns.phone] || row.phone || row.phoneNumber || '').trim(),
       sold: false,
@@ -1127,18 +1234,26 @@ app.post('/api/auction/bid', async (req, res) => {
   }
 
   player.amount = bidAmount;
-  player.team = selectedTeam?.name || '';
+  player.team = undefined;
   player.teamId = selectedTeam?._id || null;
   player.sold = status === 'sold';
   player.unsold = status === 'unsold';
   player.category = normalizedCategory;
   await player.save();
+  await Player.updateOne({ _id: player._id }, { $unset: { team: '' } });
 
   if (status === 'sold') {
     await Player.findByIdAndUpdate(playerId, { sold: true, unsold: false });
   }
 
-  res.json({ message: 'Bid saved', category: normalizedCategory, player });
+  res.json({
+    message: 'Bid saved',
+    category: normalizedCategory,
+    player: {
+      ...player.toObject(),
+      team: selectedTeam?.name || ''
+    }
+  });
 });
 
 app.get('/api/settings', async (_req, res) => {
@@ -1174,18 +1289,6 @@ app.post('/api/settings', durableUpload(upload.any()), async (req, res) => {
     wicketkeeper: uploadedFiles.find((file) => file.fieldname === 'categoryImage_wicketkeeper'),
     mvp: uploadedFiles.find((file) => file.fieldname === 'categoryImage_mvp')
   };
-  const teamNames = Array.isArray(req.body.teamName) ? req.body.teamName : req.body.teamName ? [req.body.teamName] : [];
-  const existingTeamLogos = Array.isArray(req.body.existingTeamLogo) ? req.body.existingTeamLogo : req.body.existingTeamLogo ? [req.body.existingTeamLogo] : [];
-  const teams = teamNames
-    .map((name, index) => {
-      const teamLogoFile = uploadedFiles.find((file) => file.fieldname === `teamLogo_${index}`);
-      return {
-        name: String(name || '').trim(),
-        logo: teamLogoFile ? `/uploads/${teamLogoFile.filename}` : existingTeamLogos[index] || ''
-      };
-    })
-    .filter((team) => team.name);
-
   const nextSettings = {
     backgroundImage: backgroundFile ? `/uploads/${backgroundFile.filename}` : current?.backgroundImage || '',
     logo: logoFile ? `/uploads/${logoFile.filename}` : current?.logo || '',
@@ -1200,8 +1303,7 @@ app.post('/api/settings', durableUpload(upload.any()), async (req, res) => {
       bowler: categoryImageFiles.bowler ? `/uploads/${categoryImageFiles.bowler.filename}` : current?.categoryImages?.bowler || '',
       wicketkeeper: categoryImageFiles.wicketkeeper ? `/uploads/${categoryImageFiles.wicketkeeper.filename}` : current?.categoryImages?.wicketkeeper || '',
       mvp: categoryImageFiles.mvp ? `/uploads/${categoryImageFiles.mvp.filename}` : current?.categoryImages?.mvp || ''
-    },
-    teams
+    }
   };
 
   if (current) {
@@ -1238,7 +1340,7 @@ app.get('/api/export/excel', async (_req, res) => {
         Amount: player.amount,
         'Phone Number': player.phone || '',
         'T-Shirt Size': player.tshirtSize || '',
-        Team: player.team || team.name
+        Team: team.name
       }));
 
     const sheet = XLSX.utils.json_to_sheet(sheetData);

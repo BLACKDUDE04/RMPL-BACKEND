@@ -4,9 +4,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-const XLSX = require('xlsx');
 const mongoose = require('mongoose');
-const sharp = require('sharp');
 
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
@@ -15,7 +13,20 @@ app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3001;
 const uploadDir = path.join(__dirname, 'public', 'uploads');
 let dataVersion = Date.now();
+const liveDataClients = new Set();
+let xlsxModule;
+let sharpModule;
 fs.mkdirSync(uploadDir, { recursive: true });
+
+const getXlsx = () => {
+  if (!xlsxModule) xlsxModule = require('xlsx');
+  return xlsxModule;
+};
+
+const getSharp = () => {
+  if (!sharpModule) sharpModule = require('sharp');
+  return sharpModule;
+};
 
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, uploadDir),
@@ -60,7 +71,7 @@ async function optimizeImageUpload(file) {
   const temporaryPath = path.join(parsedPath.dir, `${path.parse(file.filename).name}.optimizing.webp`);
 
   try {
-    await sharp(file.path, { failOn: 'warning', limitInputPixels: 50_000_000 })
+    await getSharp()(file.path, { failOn: 'warning', limitInputPixels: 50_000_000 })
       .rotate()
       .resize({
         width: maxDimension,
@@ -353,6 +364,10 @@ const settingsSchema = new mongoose.Schema({
   }]
 }, { timestamps: true });
 
+playerSchema.index({ source: 1, registrationStatus: 1, createdAt: 1 });
+playerSchema.index({ teamId: 1, sold: 1 });
+playerSchema.index({ category: 1, sold: 1, unsold: 1, auctionNumber: 1 });
+
 const Player = mongoose.model('Player', playerSchema);
 const Settings = mongoose.model('Settings', settingsSchema);
 const teamSchema = new mongoose.Schema({
@@ -384,7 +399,7 @@ async function connectDatabase() {
   console.log(`Connected to MongoDB (${mongoose.connection.name})`);
 }
 
-async function initializeDatabase() {
+async function initializePlayerData() {
   await Player.updateMany(
     {
       sold: { $ne: true },
@@ -394,24 +409,38 @@ async function initializeDatabase() {
     [{ $set: { playedIn: '$team', team: '' } }]
   );
 
-  for (const category of ['allrounder', 'batsmen', 'bowler', 'wicketkeeper', 'mvp']) {
-    const numberedPlayers = await Player.find({ category, auctionNumber: { $ne: null } }).select('auctionNumber').lean();
-    const usedNumbers = new Set(numberedPlayers.map((player) => player.auctionNumber));
-    let nextNumber = 1;
-    const unnumberedPlayers = await Player.find({
-      category,
-      $or: [{ auctionNumber: { $exists: false } }, { auctionNumber: null }]
-    }).sort({ createdAt: 1 });
-    for (const player of unnumberedPlayers) {
-      while (usedNumbers.has(nextNumber)) nextNumber += 1;
-      player.auctionNumber = nextNumber;
-      usedNumbers.add(nextNumber);
-      await player.save();
-    }
-  }
+  await Promise.all(
+    ['allrounder', 'batsmen', 'bowler', 'wicketkeeper', 'mvp'].map(async (category) => {
+      const [numberedPlayers, unnumberedPlayers] = await Promise.all([
+        Player.find({ category, auctionNumber: { $ne: null } }).select('auctionNumber').lean(),
+        Player.find({
+          category,
+          $or: [{ auctionNumber: { $exists: false } }, { auctionNumber: null }]
+        }).sort({ createdAt: 1 }).select('_id').lean()
+      ]);
+      const usedNumbers = new Set(numberedPlayers.map((player) => player.auctionNumber));
+      let nextNumber = 1;
+      const updates = unnumberedPlayers.map((player) => {
+        while (usedNumbers.has(nextNumber)) nextNumber += 1;
+        const auctionNumber = nextNumber;
+        usedNumbers.add(auctionNumber);
+        nextNumber += 1;
+        return {
+          updateOne: {
+            filter: { _id: player._id },
+            update: { $set: { auctionNumber } }
+          }
+        };
+      });
+
+      if (updates.length) {
+        await Player.bulkWrite(updates, { ordered: false });
+      }
+    })
+  );
 
   const registrationPlayers = await Player.find({ source: 'registration' }).lean();
-  for (const player of registrationPlayers) {
+  const registrationUpdates = registrationPlayers.flatMap((player) => {
     const selectedRoles = parseRoleSelections(player.registrationRoles || []);
     const nextCategory = resolveRegistrationCategory(selectedRoles, player.category || 'allrounder');
     const updates = {};
@@ -419,19 +448,30 @@ async function initializeDatabase() {
       updates.category = nextCategory;
     }
     if (selectedRoles.length) {
-      updates.details = resolveRegistrationDetails(selectedRoles);
+      const nextDetails = resolveRegistrationDetails(selectedRoles);
+      if (nextDetails !== player.details) updates.details = nextDetails;
     }
-    if (Object.keys(updates).length) {
-      await Player.updateOne({ _id: player._id }, { $set: updates });
-    }
-  }
+    return Object.keys(updates).length
+      ? [{ updateOne: { filter: { _id: player._id }, update: { $set: updates } } }]
+      : [];
+  });
 
+  if (registrationUpdates.length) {
+    await Player.bulkWrite(registrationUpdates, { ordered: false });
+  }
+}
+
+async function initializeSettingsData() {
   const settingsCount = await Settings.countDocuments();
   if (settingsCount === 0) {
     await Settings.create({ backgroundImage: '', logo: '', teams: [] });
   } else {
     await Settings.updateMany({ teams: { $exists: false } }, { $set: { teams: [] } });
   }
+}
+
+async function initializeDatabase() {
+  await Promise.all([initializePlayerData(), initializeSettingsData()]);
 }
 
 const allowedClientOrigins = new Set(
@@ -447,7 +487,8 @@ app.use(cors({
       return callback(null, true);
     }
     return callback(new Error('Origin is not allowed by CORS'));
-  }
+  },
+  maxAge: 86400
 }));
 app.use(express.json({ limit: '10mb' }));
 
@@ -491,6 +532,14 @@ app.use((req, res, next) => {
     res.on('finish', () => {
       if (res.statusCode >= 200 && res.statusCode < 400) {
         dataVersion = Math.max(Date.now(), dataVersion + 1);
+        const message = `event: version\ndata: ${JSON.stringify({ version: dataVersion })}\n\n`;
+        liveDataClients.forEach((client) => {
+          if (client.destroyed || client.writableEnded) {
+            liveDataClients.delete(client);
+          } else {
+            client.write(message);
+          }
+        });
       }
     });
   }
@@ -498,14 +547,41 @@ app.use((req, res, next) => {
 });
 
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
-app.get('/api/data-version', (_req, res) => res.json({ version: dataVersion }));
+app.get('/api/data-version', (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ version: dataVersion });
+});
 
-app.get('/api/categories', async (_req, res) => {
-  const players = await Player.find({
-    sold: { $ne: true },
-    unsold: { $ne: true }
-  }).sort({ category: 1, auctionNumber: 1 }).lean();
-  const visiblePlayers = players.filter((player) => player.source !== 'registration' || player.registrationStatus === 'approved');
+app.get('/api/live-events', (req, res) => {
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  res.flushHeaders?.();
+  liveDataClients.add(res);
+  res.write(`retry: 2000\nevent: version\ndata: ${JSON.stringify({ version: dataVersion })}\n\n`);
+
+  const heartbeat = setInterval(() => {
+    res.write(': keep-alive\n\n');
+  }, 25000);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    liveDataClients.delete(res);
+  });
+});
+
+const categoryNames = {
+  allrounder: 'All Rounder',
+  batsmen: 'Batsmen',
+  bowler: 'Bowler',
+  wicketkeeper: 'Wicket Keeper',
+  mvp: 'MVP Players'
+};
+
+function buildCategories(players) {
   const categoryMap = {
     allrounder: [],
     batsmen: [],
@@ -514,38 +590,90 @@ app.get('/api/categories', async (_req, res) => {
     mvp: []
   };
 
-  visiblePlayers.forEach((player) => {
+  players.forEach((player) => {
     if (categoryMap[player.category]) {
       categoryMap[player.category].push(player);
     }
   });
 
-  const categoryNames = { allrounder: 'All Rounder', batsmen: 'Batsmen', bowler: 'Bowler', wicketkeeper: 'Wicket Keeper', mvp: 'MVP Players' };
-  const categories = Object.entries(categoryMap).map(([key, entries]) => ({
+  return Object.entries(categoryMap).map(([key, entries]) => ({
     key,
     label: categoryNames[key],
     count: entries.length,
     players: entries
   }));
+}
 
-  res.json({ categories });
+async function loadCategories() {
+  const players = await Player.find({
+    sold: { $ne: true },
+    unsold: { $ne: true },
+    $or: [
+      { source: { $ne: 'registration' } },
+      { registrationStatus: 'approved' }
+    ]
+  }).sort({ category: 1, auctionNumber: 1 }).lean();
+
+  return buildCategories(players);
+}
+
+async function loadPendingRegistrations() {
+  return Player.find({
+    source: 'registration',
+    $or: [{ registrationStatus: { $exists: false } }, { registrationStatus: 'pending' }]
+  }).sort({ createdAt: 1 }).lean();
+}
+
+app.get('/api/categories', async (_req, res) => {
+  res.json({ categories: await loadCategories() });
 });
 
 async function teamsWithStats() {
-  const teams = await Team.find().sort({ name: 1 }).lean();
-  return Promise.all(teams.map(async (team) => {
-    const soldPlayers = await Player.find({ teamId: team._id, sold: true }).lean();
+  const [teams, soldPlayers] = await Promise.all([
+    Team.find().sort({ name: 1 }).lean(),
+    Player.find({ teamId: { $ne: null }, sold: true }).lean()
+  ]);
+  const playersByTeam = new Map();
+
+  soldPlayers.forEach((player) => {
+    const teamKey = String(player.teamId);
+    const teamPlayers = playersByTeam.get(teamKey) || [];
+    teamPlayers.push(player);
+    playersByTeam.set(teamKey, teamPlayers);
+  });
+
+  return teams.map((team) => {
+    const teamPlayers = playersByTeam.get(String(team._id)) || [];
     return {
       ...team,
-      playerCount: soldPlayers.length,
-      spent: soldPlayers.reduce((total, player) => total + Number(player.amount || 0), 0),
-      players: soldPlayers
+      playerCount: teamPlayers.length,
+      spent: teamPlayers.reduce((total, player) => total + Number(player.amount || 0), 0),
+      players: teamPlayers
     };
-  }));
+  });
 }
 
 app.get('/api/teams', async (_req, res) => {
   res.json({ teams: await teamsWithStats() });
+});
+
+app.get('/api/bootstrap', async (_req, res) => {
+  const version = dataVersion;
+  const [categories, settings, teams, pendingRegistrations] = await Promise.all([
+    loadCategories(),
+    Settings.findOne().lean(),
+    teamsWithStats(),
+    loadPendingRegistrations()
+  ]);
+
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    version,
+    categories,
+    settings: settings || { backgroundImage: '', logo: '' },
+    teams,
+    pendingRegistrations
+  });
 });
 
 app.post('/api/teams', durableUpload(upload.single('teamLogo')), async (req, res) => {
@@ -701,12 +829,7 @@ app.post('/api/players', durableUpload(upload.single('image')), async (req, res)
 });
 
 app.get('/api/players/registrations/pending', async (_req, res) => {
-  const registrations = await Player.find({
-    source: 'registration',
-    $or: [{ registrationStatus: { $exists: false } }, { registrationStatus: 'pending' }]
-  }).sort({ createdAt: 1 }).lean();
-
-  res.json({ registrations });
+  res.json({ registrations: await loadPendingRegistrations() });
 });
 
 app.get('/api/players/registrations', async (_req, res) => {
@@ -889,6 +1012,7 @@ app.post('/api/excel/import', durableUpload(upload.single('excelFile')), async (
   }
 
   try {
+    const XLSX = getXlsx();
     const workbook = XLSX.readFile(req.file.path);
     const sheet = workbook.Sheets[workbook.SheetNames[0]];
     const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
@@ -937,6 +1061,7 @@ app.post('/api/excel/import', durableUpload(upload.single('excelFile')), async (
 });
 
 app.get('/api/excel/template', (req, res) => {
+  const XLSX = getXlsx();
   const columns = {
     [req.query.nameColumn || 'name']: 'Sample Player',
     [req.query.categoryColumn || 'category']: 'allrounder',
@@ -1098,6 +1223,7 @@ app.post('/api/settings', durableUpload(upload.any()), async (req, res) => {
 });
 
 app.get('/api/export/excel', async (_req, res) => {
+  const XLSX = getXlsx();
   const workbook = XLSX.utils.book_new();
   const players = await Player.find({ sold: true }).lean();
   const teams = await Team.find().sort({ name: 1 }).lean();
@@ -1134,8 +1260,7 @@ app.get('/api/export/excel', async (_req, res) => {
 async function startServer() {
   try {
     await connectDatabase();
-    await migrateLocalUploads();
-    await initializeDatabase();
+    await Promise.all([migrateLocalUploads(), initializeDatabase()]);
     app.listen(PORT, () => {
       console.log(`Auction server running at http://localhost:${PORT}`);
     });

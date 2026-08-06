@@ -1991,6 +1991,78 @@ function registerScoringRoutes(app, {
     res.json({ match: deriveMatchView(match) });
   }));
 
+  app.get('/api/matches/:id/excel', route(async (req, res) => {
+    const match = await findHydratedMatchById(req.params.id, { lean: true });
+    if (!match) throw new ScoringError('Match not found', 404);
+
+    const XLSX = require('xlsx');
+    const view = deriveMatchView(match);
+    const workbook = XLSX.utils.book_new();
+    const addSheet = (name, rows) => {
+      const safeName = name.replace(/[\\/?*[\]:]/g, '-').slice(0, 31);
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(rows), safeName);
+    };
+    const teamA = view.teamA?.name || 'Team A';
+    const teamB = view.teamB?.name || 'Team B';
+
+    addSheet('Match Summary', [{
+      Match: view.title || `${teamA} vs ${teamB}`,
+      'Team A': teamA,
+      'Team B': teamB,
+      Status: String(view.status || '').replaceAll('_', ' '),
+      Venue: view.venue || '',
+      Scheduled: view.scheduledAt ? new Date(view.scheduledAt).toISOString() : '',
+      Overs: view.oversPerInnings || '',
+      Result: view.result?.text || view.result?.summary || view.result || ''
+    }]);
+
+    (view.innings || []).forEach((innings, index) => {
+      const prefix = `Inn ${index + 1}`;
+      addSheet(`${prefix} Batting`, (innings.battingScorecard || []).map((entry) => ({
+        Batter: entry.name,
+        Dismissal: entry.dismissal || 'not out',
+        Runs: entry.runs,
+        Balls: entry.balls,
+        Fours: entry.fours,
+        Sixes: entry.sixes,
+        'Strike Rate': entry.strikeRate
+      })));
+      addSheet(`${prefix} Bowling`, (innings.bowlingScorecard || []).map((entry) => ({
+        Bowler: entry.name,
+        Overs: entry.overs,
+        Maidens: entry.maidens,
+        Runs: entry.runs,
+        Wickets: entry.wickets,
+        Wides: entry.wides,
+        'No Balls': entry.noBalls,
+        Economy: entry.economy
+      })));
+      addSheet(`${prefix} Deliveries`, (innings.deliveries || []).map((delivery) => ({
+        Ball: delivery.displayBall,
+        Striker: delivery.strikerName || '',
+        Bowler: delivery.bowlerName || '',
+        Runs: delivery.totalRuns,
+        'Bat Runs': delivery.runsOffBat,
+        Extras: Object.entries(delivery.extras || {})
+          .filter(([, value]) => Number(value))
+          .map(([key, value]) => `${key}: ${value}`)
+          .join(', '),
+        Wicket: delivery.wicket?.dismissedBatterName || '',
+        Notes: delivery.notes || ''
+      })));
+    });
+
+    const slug = String(view.title || `${teamA}-vs-${teamB}`)
+      .normalize('NFKD')
+      .replace(/[^a-zA-Z0-9]+/g, '-')
+      .replace(/^-|-$/g, '')
+      .toLowerCase() || 'match-record';
+    const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+    res.setHeader('Content-Disposition', `attachment; filename="${slug}.xlsx"`);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.send(buffer);
+  }));
+
   app.patch('/api/matches/:id', authRoute(async (req, res) => {
     const match = await findHydratedMatchById(req.params.id);
     if (!match) throw new ScoringError('Match not found', 404);

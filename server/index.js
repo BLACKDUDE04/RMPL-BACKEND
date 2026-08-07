@@ -330,6 +330,7 @@ const playerSchema = new mongoose.Schema({
   age: Number,
   phone: String,
   tshirtSize: String,
+  tshirtName: String,
   sold: Boolean,
   unsold: Boolean,
   source: String,
@@ -957,6 +958,7 @@ app.post('/api/players/register', durableUpload(upload.fields([{ name: 'image', 
     const phone = String(req.body.phone || '').trim();
     const playedIn = String(req.body.playedIn || req.body.previouslyPlayedIn || '').trim();
     const tshirtSize = String(req.body.tshirtSize || '').trim();
+    const tshirtName = String(req.body.tshirtName || '').trim();
     const selectedRoles = parseRoleSelections(req.body.roles);
     const imageFile = req.files?.image?.[0];
     const paymentFile = req.files?.paymentReceipt?.[0];
@@ -975,6 +977,9 @@ app.post('/api/players/register', durableUpload(upload.fields([{ name: 'image', 
     }
     if (!/^\d+$/.test(tshirtSize) || Number(tshirtSize) < 1) {
       return res.status(400).json({ message: 'Please enter a valid numeric T-shirt size' });
+    }
+    if (!tshirtName) {
+      return res.status(400).json({ message: 'Name to be printed on the T-shirt is required' });
     }
     if (!selectedRoles.length) {
       return res.status(400).json({ message: 'Please select at least one role for the player' });
@@ -999,6 +1004,7 @@ app.post('/api/players/register', durableUpload(upload.fields([{ name: 'image', 
       amount: 0,
       phone,
       tshirtSize,
+      tshirtName,
       sold: false,
       unsold: false,
       source: 'registration',
@@ -1223,13 +1229,16 @@ app.post('/api/auction/bid', async (req, res) => {
       if (playersStillRequired <= 0) {
         return res.status(400).json({ message: `This team already has the maximum ${auctionSettings.maxPlayersPerTeam} players. Its bidding is closed.` });
       }
-      const cheapestRemaining = await Player.findOne({
-        _id: { $ne: playerId }, sold: { $ne: true }, unsold: { $ne: true },
-        $or: [{ source: { $ne: 'registration' } }, { registrationStatus: 'approved' }], amount: { $gt: 0 }
-      }).sort({ amount: 1 }).select('amount').lean();
+      const playersRequiredAfterThisBid = Math.max(0, playersStillRequired - 1);
+      const cheapestRemaining = playersRequiredAfterThisBid > 0
+        ? await Player.find({
+          _id: { $ne: playerId }, sold: { $ne: true }, unsold: { $ne: true },
+          $or: [{ source: { $ne: 'registration' } }, { registrationStatus: 'approved' }], amount: { $gt: 0 }
+        }).sort({ amount: 1 }).limit(playersRequiredAfterThisBid).select('amount').lean()
+        : [];
       const team = await Team.findById(teamId).select('remainingPurse').lean();
       if (!team) return res.status(400).json({ message: 'Select a valid team' });
-      const reserve = Math.max(0, playersStillRequired - 1) * Number(cheapestRemaining?.amount || 0);
+      const reserve = cheapestRemaining.reduce((total, availablePlayer) => total + Number(availablePlayer.amount || 0), 0);
       const maximumBid = Math.max(0, Number(team.remainingPurse || 0) - reserve);
       if (bidAmount > maximumBid) {
         return res.status(400).json({ message: `Maximum safe bid is ${maximumBid.toLocaleString()} Points. The remaining purse is reserved for ${playersStillRequired - 1} more player(s).` });
@@ -1352,6 +1361,7 @@ app.get('/api/export/excel', async (_req, res) => {
         Amount: player.amount,
         'Phone Number': player.phone || '',
         'T-Shirt Size': player.tshirtSize || '',
+        'T-Shirt Name': player.tshirtName || '',
         Team: team.name
       }));
 

@@ -1219,8 +1219,20 @@ app.post('/api/auction/bid', async (req, res) => {
     const auctionSettings = await Settings.findOne().lean();
     if (auctionSettings?.playerLimitEnabled && Number(auctionSettings.maxPlayersPerTeam) > 0) {
       const purchasedPlayerCount = await Player.countDocuments({ teamId, sold: true });
-      if (purchasedPlayerCount >= Number(auctionSettings.maxPlayersPerTeam)) {
+      const playersStillRequired = Number(auctionSettings.maxPlayersPerTeam) - purchasedPlayerCount;
+      if (playersStillRequired <= 0) {
         return res.status(400).json({ message: `This team already has the maximum ${auctionSettings.maxPlayersPerTeam} players. Its bidding is closed.` });
+      }
+      const cheapestRemaining = await Player.findOne({
+        _id: { $ne: playerId }, sold: { $ne: true }, unsold: { $ne: true },
+        $or: [{ source: { $ne: 'registration' } }, { registrationStatus: 'approved' }], amount: { $gt: 0 }
+      }).sort({ amount: 1 }).select('amount').lean();
+      const team = await Team.findById(teamId).select('remainingPurse').lean();
+      if (!team) return res.status(400).json({ message: 'Select a valid team' });
+      const reserve = Math.max(0, playersStillRequired - 1) * Number(cheapestRemaining?.amount || 0);
+      const maximumBid = Math.max(0, Number(team.remainingPurse || 0) - reserve);
+      if (bidAmount > maximumBid) {
+        return res.status(400).json({ message: `Maximum safe bid is ${maximumBid.toLocaleString()} Points. The remaining purse is reserved for ${playersStillRequired - 1} more player(s).` });
       }
     }
     selectedTeam = await Team.findOneAndUpdate(

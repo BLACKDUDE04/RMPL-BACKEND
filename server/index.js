@@ -1378,7 +1378,7 @@ app.get('/api/export/excel', async (_req, res) => {
         'Phone Number': player.phone || '',
         'T-Shirt Size': player.tshirtSize || '',
         'T-Shirt Name': player.tshirtName || '',
-        'CricHeroes Profile': player.cricheroesId ? `https://cricheroes.com/player-profile/${player.cricheroesId}` : '',
+        'CricHeroes Profile': player.cricheroesId ? `https://cricheroes.com/player-profile/${player.cricheroesId}/player/profile` : '',
         Team: team.name
       }));
 

@@ -331,6 +331,7 @@ const playerSchema = new mongoose.Schema({
   phone: String,
   tshirtSize: String,
   tshirtName: String,
+  cricheroesId: String,
   sold: Boolean,
   unsold: Boolean,
   source: String,
@@ -893,9 +894,13 @@ function resolveRegistrationDetails(selectedRoles = [], fallbackDetails = '') {
 
 app.post('/api/players', durableUpload(upload.single('image')), async (req, res) => {
   const { name, age, details, category, playedIn, team, amount, phone, imageUrl } = req.body;
+  const cricheroesId = String(req.body.cricheroesId || '').trim();
 
   if (!name?.trim()) {
     return res.status(400).json({ message: 'Player name is required' });
+  }
+  if (cricheroesId && !/^\d+$/.test(cricheroesId)) {
+    return res.status(400).json({ message: 'CricHeroes ID must contain numbers only' });
   }
 
   const normalizedCategory = normalizeCategory(category);
@@ -910,6 +915,7 @@ app.post('/api/players', durableUpload(upload.single('image')), async (req, res)
     playedIn: playedIn?.trim() || team?.trim() || '',
     amount: Number(amount || 0),
     phone: phone?.trim() || '',
+    cricheroesId,
     sold: false,
     unsold: false,
     source: 'manual'
@@ -959,6 +965,7 @@ app.post('/api/players/register', durableUpload(upload.fields([{ name: 'image', 
     const playedIn = String(req.body.playedIn || req.body.previouslyPlayedIn || '').trim();
     const tshirtSize = String(req.body.tshirtSize || '').trim();
     const tshirtName = String(req.body.tshirtName || '').trim();
+    const cricheroesId = String(req.body.cricheroesId || '').trim();
     const selectedRoles = parseRoleSelections(req.body.roles);
     const imageFile = req.files?.image?.[0];
     const paymentFile = req.files?.paymentReceipt?.[0];
@@ -980,6 +987,9 @@ app.post('/api/players/register', durableUpload(upload.fields([{ name: 'image', 
     }
     if (!tshirtName) {
       return res.status(400).json({ message: 'Name to be printed on the T-shirt is required' });
+    }
+    if (cricheroesId && !/^\d+$/.test(cricheroesId)) {
+      return res.status(400).json({ message: 'CricHeroes ID must contain numbers only' });
     }
     if (!selectedRoles.length) {
       return res.status(400).json({ message: 'Please select at least one role for the player' });
@@ -1005,6 +1015,7 @@ app.post('/api/players/register', durableUpload(upload.fields([{ name: 'image', 
       phone,
       tshirtSize,
       tshirtName,
+      cricheroesId,
       sold: false,
       unsold: false,
       source: 'registration',
@@ -1027,6 +1038,10 @@ app.put('/api/players/:id', durableUpload(upload.single('image')), async (req, r
   const { name, age, details, category, playedIn, team, amount, phone, image, imageUrl } = req.body;
   if (!name?.trim()) {
     return res.status(400).json({ message: 'Player name is required' });
+  }
+  const cricheroesId = String(req.body.cricheroesId || '').trim();
+  if (cricheroesId && !/^\d+$/.test(cricheroesId)) {
+    return res.status(400).json({ message: 'CricHeroes ID must contain numbers only' });
   }
 
   const existingPlayer = await Player.findById(req.params.id);
@@ -1061,6 +1076,7 @@ app.put('/api/players/:id', durableUpload(upload.single('image')), async (req, r
         playedIn: playedIn?.trim() || (!existingPlayer.sold ? team?.trim() : '') || existingPlayer.playedIn || '',
         amount: nextAmount,
         phone: phone?.trim() || existingPlayer.phone || '',
+        cricheroesId,
         image: req.file ? `/uploads/${req.file.filename}` : imageUrl?.trim() || image?.trim() || existingPlayer.image || ''
       },
       $unset: { team: '' }
@@ -1362,10 +1378,16 @@ app.get('/api/export/excel', async (_req, res) => {
         'Phone Number': player.phone || '',
         'T-Shirt Size': player.tshirtSize || '',
         'T-Shirt Name': player.tshirtName || '',
+        'CricHeroes Profile': player.cricheroesId ? `https://cricheroes.com/player-profile/${player.cricheroesId}` : '',
         Team: team.name
       }));
 
     const sheet = XLSX.utils.json_to_sheet(sheetData);
+    sheetData.forEach((row, rowIndex) => {
+      if (!row['CricHeroes Profile']) return;
+      const cell = sheet[`H${rowIndex + 2}`];
+      if (cell) cell.l = { Target: row['CricHeroes Profile'], Tooltip: 'Open CricHeroes profile' };
+    });
     const safeTeamName = team.name.replace(/[\\/?*[\]:]/g, '-').slice(0, 27);
     XLSX.utils.book_append_sheet(workbook, sheet, `${safeTeamName || 'Team'}-${index + 1}`);
   });
